@@ -12,15 +12,14 @@ import platform
 import sqlite3
 import argparse
 import pathlib
+import hashlib
 from collections import defaultdict
 from typing import Dict, Any, Iterable
 from pathlib import Path
 from flask import Flask, Response, jsonify, send_from_directory, request
 from flask_cors import CORS
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Logger will be configured after argument parsing
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='frontend/build')
@@ -93,6 +92,7 @@ def iter_chat_from_item_table(db: pathlib.Path) -> Iterable[tuple[str,str,str,st
         
         # Try to get chat data from workbench.panel.aichat.view.aichat.chatdata
         chat_data = j(cur, "ItemTable", "workbench.panel.aichat.view.aichat.chatdata")
+        
         if chat_data and "tabs" in chat_data:
             for tab in chat_data.get("tabs", []):
                 tab_id = tab.get("tabId", "unknown")
@@ -111,6 +111,8 @@ def iter_chat_from_item_table(db: pathlib.Path) -> Iterable[tuple[str,str,str,st
                     if text and isinstance(text, str):
                         role = "user" if bubble_type == "user" else "assistant"
                         yield tab_id, role, text, str(db)
+        else:
+            logger.debug(f"  - Did not find messages in workspace {db}")
         
         # Check for composer data
         composer_data = j(cur, "ItemTable", "composer.composerData")
@@ -123,23 +125,59 @@ def iter_chat_from_item_table(db: pathlib.Path) -> Iterable[tuple[str,str,str,st
                     content = msg.get("content", "")
                     if content:
                         yield comp_id, role, content, str(db)
+        else:
+            logger.debug(f"  - Did not find composer data in workspace {db}")
         
         # Also check for aiService entries
-        for key_prefix in ["aiService.prompts", "aiService.generations"]:
-            try:
-                cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE ?", (f"{key_prefix}%",))
-                for k, v in cur.fetchall():
-                    try:
-                        data = json.loads(v)
-                        if isinstance(data, list):
-                            for item in data:
-                                if "id" in item and "text" in item:
-                                    role = "user" if "prompts" in key_prefix else "assistant"
-                                    yield item.get("id", "unknown"), role, item.get("text", ""), str(db)
-                    except json.JSONDecodeError:
-                        continue
-            except sqlite3.Error:
-                continue
+        # Create a synthetic composerId for aiService data from this workspace
+        # Use a hash of the db path to create a consistent ID
+        db_hash = hashlib.md5(str(db).encode()).hexdigest()[:8]
+        ai_service_composer_id = f"aiService-{db_hash}"
+        
+        # Process prompts (user messages)
+        try:
+            cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE ?", ("aiService.prompts%",))
+            for k, v in cur.fetchall():
+                try:
+                    data = json.loads(v)
+                    if isinstance(data, list):
+                        logger.debug(f"  - Found {len(data)} prompts in aiService.prompts for workspace {db}")
+                        for item in data:
+                            # Prompts have "text" field - these are user messages
+                            if "text" in item and item.get("text"):
+                                text = item.get("text", "").strip()
+                                if text:
+                                    logger.debug(f"  - Extracting prompt (user): {text[:50]}...")
+                                    yield ai_service_composer_id, "user", text, str(db)
+                except json.JSONDecodeError as e:
+                    logger.debug(f"  - Failed to parse prompts JSON: {e}")
+                    continue
+        except sqlite3.Error as e:
+            logger.debug(f"  - Error querying aiService.prompts: {e}")
+        
+        # Process generations
+        # Note: Based on the data structure, textDescription in generations appears to be user prompts,
+        # not assistant responses. Treat them as user messages.
+        try:
+            cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE ?", ("aiService.generations%",))
+            for k, v in cur.fetchall():
+                try:
+                    data = json.loads(v)
+                    if isinstance(data, list):
+                        logger.debug(f"  - Found {len(data)} generations in aiService.generations for workspace {db}")
+                        for item in data:
+                            # Generations have "textDescription" field which appears to be user prompts
+                            if "textDescription" in item and item.get("textDescription"):
+                                text = item.get("textDescription", "").strip()
+                                if text:
+                                    generation_uuid = item.get("generationUUID", "unknown")
+                                    logger.debug(f"  - Extracting generation prompt (user) {generation_uuid[:8]}: {text[:50]}...")
+                                    yield ai_service_composer_id, "user", text, str(db)
+                except json.JSONDecodeError as e:
+                    logger.debug(f"  - Failed to parse generations JSON: {e}")
+                    continue
+        except sqlite3.Error as e:
+            logger.debug(f"  - Error querying aiService.generations: {e}")
     
     except sqlite3.DatabaseError as e:
         logger.debug(f"Database error in ItemTable with {db}: {e}")
@@ -1020,8 +1058,13 @@ def serve_react(path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run the Cursor Chat View server')
     parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
-    parser.add_argument('--debug', action='store_true', help='Run in debug mode')
+    parser.add_argument('--debug', action='store_true', help='Run in debug mode (also sets logging to DEBUG level)')
     args = parser.parse_args()
     
-    logger.info(f"Starting server on port {args.port}")
+    # Configure logging based on --debug flag
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, 
+                       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    logger.info(f"Starting server on port {args.port} with log level {'DEBUG' if args.debug else 'INFO'}")
     app.run(host='127.0.0.1', port=args.port, debug=args.debug)
